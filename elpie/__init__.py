@@ -12,8 +12,24 @@ class EditorState:
     filename: str = ""
     message: str = ""
     kill_ring: list[str] = field(default_factory=list)
-    exit_pending: bool = False
+    execute_pending: bool = False
 
+@dataclass
+class AppState:
+    buffers: list[EditorState] = field(default_factory=list)
+    current: int = 0
+
+def open_buffer(path: str, app: AppState):
+    buf = EditorState()
+    buf.filename = path
+    try:
+        with open(path) as f:
+            buf.lines = f.read().splitlines() or [""]
+    except FileNotFoundError:
+        buf.lines = [""]
+    app.buffers.append(buf)
+    app.current = len(app.buffers) - 1
+    
 def draw(stdscr, st: EditorState):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
@@ -44,48 +60,165 @@ def open_file(st: EditorState, path: str):
         st.lines = [""]
     st.cy = st.cx = 0
 
+        
+# ----------------------------------------
+# Helper: yank any text chunk (may contain "\n")
+# ----------------------------------------
+def do_yank(st: EditorState, text: str):
+    if "\n" not in text:
+        # simple insert
+        line = st.lines[st.cy]
+        st.lines[st.cy] = line[:st.cx] + text + line[st.cx:]
+        st.cx += len(text)
+    else:
+        # multi-line insert
+        parts = text.split("\n")
+        need_suffix = text.endswith("\n")
+
+        old = st.lines[st.cy]
+        prefix, suffix = old[:st.cx], old[st.cx:]
+
+        new_lines = []
+        # first line = prefix + first killed piece
+        new_lines.append(prefix + parts[0])
+        # middle lines = any in-between killed lines
+        for piece in parts[1:]:
+            new_lines.append(piece)
+
+        if need_suffix:
+            # trailing newline: the suffix becomes its own line
+            new_lines.append(suffix)
+        else:
+            # no trailing newline: append suffix to last piece
+            new_lines[-1] += suffix
+
+        # splice into buffer
+        st.lines[st.cy:st.cy + 1] = new_lines
+
+        # update cursor to end of yanked block
+        st.cy += len(new_lines) - 1
+        st.cx = 0 if need_suffix else len(parts[-1])
+
+def search_forward(st, stdscr):
+    curses.echo()
+    height, _ = stdscr.getmaxyx()
+    stdscr.addstr(height - 1, 0, "Search: ")
+    query = stdscr.getstr().decode()
+    curses.noecho()
+
+    for y in range(st.cy, len(st.lines)):
+        xstart = st.cx if y == st.cy else 0
+        idx = st.lines[y].find(query, xstart)
+        if idx != -1:
+            st.cy, st.cx = y, idx
+            st.message = f"Found: {query}"
+            return
+    st.message = f"Not found: {query}"
+    
 def main(stdscr, path=None):
     curses.raw()
     stdscr.keypad(True)
-    st = EditorState()
+    app = AppState()
     if path:
-        open_file(st, path)
-
+        open_buffer(path, app)
+    else:
+        app.buffers.append(EditorState())
+    st = app.buffers[app.current]
+    
     while True:
         draw(stdscr, st)
         k = stdscr.getch()
 
         # Exit sequence Ctrl-x (24), then Ctrl-c (3)
         if k == 24:
-            st.exit_pending = True
+            st.execute_pending = True
             st.message = "^X"
             continue
-        if st.exit_pending and k == 3:
+        if st.execute_pending and k == 3:
             break
-        st.exit_pending = False
 
-        # Save (Ctrl-s)
-        if k == 19:
+        # Save (Ctrl-x Ctrl-s)
+        if st.execute_pending and k == 19:
             if not st.filename:
                 st.message = "No filename"
             else:
                 save_file(st)
             continue
 
-        # Kill-line (Ctrl-k)
-        if k == 11:
-            line = st.lines[st.cy]
-            killed = line[st.cx :]
-            st.lines[st.cy] = line[: st.cx]
-            st.kill_ring.insert(0, killed)
+        if st.execute_pending and k == ord('b'):  # Ctrl-x b
+            app.current = (app.current + 1) % len(app.buffers)
+            st = app.buffers[app.current]
             continue
 
-        # Yank (Ctrl-y)
-        if k == 25:
+        if st.execute_pending and k == 6:  # Ctrl-x Ctrl-f
+            curses.echo()
+            height, _ = stdscr.getmaxyx()
+            stdscr.addstr(height - 1, 0, "Open: ")
+            stdscr.clrtoeol()
+            stdscr.refresh()
+            path = stdscr.getstr().decode()
+            curses.noecho()
+            open_buffer(path, app)
+            st = app.buffers[app.current]
+            continue
+
+        st.execute_pending = False
+
+        # Search (Ctrl-s)
+        # Ctrl-s: search forward
+        if k == 19:
+            search_forward(st, stdscr)
+            continue
+        
+        # ----------------------------------------
+        # Ctrl-K: kill‐line
+        # ----------------------------------------
+        if k == 11:  # Ctrl-K
+            line = st.lines[st.cy]
+        
+            if st.cx < len(line):
+                # kill from cursor to end-of-line, plus newline if there's a next line
+                if st.cy + 1 < len(st.lines):
+                    killed = line[st.cx:] + "\n"
+                    # join with next line
+                    st.lines[st.cy] = line[:st.cx] + st.lines.pop(st.cy + 1)
+                else:
+                    killed = line[st.cx:]
+                    st.lines[st.cy] = line[:st.cx]
+            else:
+                # at end-of-line: kill the newline only (if any)
+                if st.cy + 1 < len(st.lines):
+                    killed = "\n"
+                    st.lines[st.cy] = line + st.lines.pop(st.cy + 1)
+                else:
+                    killed = ""
+        
+            if killed:
+                st.kill_ring.insert(0, killed)
+            continue
+        
+        # ----------------------------------------
+        # Ctrl-Y: yank most recent kill
+        # ----------------------------------------
+        if k == 25:  # Ctrl-Y
             if st.kill_ring:
-                text = st.kill_ring[0]
-                st.lines[st.cy] = st.lines[st.cy][: st.cx] + text + st.lines[st.cy][st.cx :]
-                st.cx += len(text)
+                do_yank(st, st.kill_ring[0])
+            continue
+        
+        
+        # ----------------------------------------
+        # Alt-Y: rotate the kill-ring, then yank
+        # ----------------------------------------
+        if k == 27:  # ESC, start of an Alt-sequence
+            nxt = stdscr.getch()
+            if nxt == ord("y"):
+                if len(st.kill_ring) > 1:
+                    # move the head to the tail
+                    st.kill_ring.append(st.kill_ring.pop(0))
+                do_yank(st, st.kill_ring[0])
+            else:
+                # you could handle other Alt-keys here
+                pass
             continue
 
         # Movement

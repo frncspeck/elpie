@@ -41,6 +41,8 @@ Providing a filename opens (or creates) that file. Omitting the argument opens a
 | Ctrl-k             | Kill from cursor to end of line             |  
 | Ctrl-y             | Yank (paste) last killed text               |  
 | Ctrl-s             | Save current buffer                         |  
+| Ctrl-x, Ctrl-f     | Open file                                   |  
+| Ctrl-x, b          | Switch buffer                               |  
 | Ctrl-x, Ctrl-c     | Exit editor                                 |  
 
 ## Configuration
